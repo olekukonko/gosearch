@@ -1,55 +1,55 @@
-// Package main contains the implementation of GoSearch, a tool for searching usernames across various websites
-// and checking for compromised credentials.
 package main
 
 import (
-	"compress/gzip"
-	"compress/zlib"
 	"crypto/tls"
-	"errors"
 	"flag"
 	"fmt"
-	"github.com/olekukonko/tablewriter/renderer"
 	"io"
-	"log"
-	"net"
 	"net/http"
 	"os"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"github.com/andybalholm/brotli"
 	"github.com/bytedance/sonic"
-	"github.com/ibnaleem/gobreach"
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/httprate"
 	"github.com/inancgumus/screen"
+	"github.com/manifoldco/promptui"
+	"github.com/olekukonko/ll"
+	"github.com/olekukonko/ll/lx"
 	"github.com/olekukonko/tablewriter"
+	"github.com/olekukonko/tablewriter/renderer"
 	"github.com/olekukonko/tablewriter/tw"
 )
 
 // GoSearch ASCII logo displayed at program start.
 const ASCII = `
- ________  ________  ________  _______   ________  ________  ________  ___  ___     
-|\   ____\|\   __  \|\   ____\|\  ___ \ |\   __  \|\   __  \|\   ____\|\  \|\  \    
-\ \  \___|\ \  \|\  \ \  \___|\ \   __/|\ \  \|\  \ \  \|\  \ \  \___|\ \  \\\  \   
- \ \  \  __\ \  \\\  \ \_____  \ \  \_|/_\ \   __  \ \   _  _\ \  \    \ \   __  \  
-  \ \  \|\  \ \  \\\  \|____|\  \ \  \_|\ \ \  \ \  \ \  \\  \\ \  \____\ \  \ \  \ 
-   \ \_______\ \_______\____\_\  \ \_______\ \__\ \__\ \__\\ _\\ \_______\ \__\ \__\
-    \|_______|\|_______|\_________\|_______|\|__|\|__|\|__|\|__|\|_______|\|__|\|__|
-                       \|_________|
+________  ________  ________  _______   ________  ________  ________  ___  ___
+|\   ____\|\   __  \|\   ____\|\  ___ \ |\   __  \|\   __  \|\   ____\|\  \|\  \
+\ \  \___|\ \  \|\  \ \  \___|\ \   __/|\ \  \|\  \ \  \|\  \ \  \___|\ \  \\\  \
+\ \  \  __\ \  \\\  \ \_____  \ \  \_|/_\ \   __  \ \   _  _\ \  \    \ \   __  \
+\ \  \|\  \ \  \\\  \|____|\  \ \  \_|\ \ \  \ \  \ \  \\  \\ \  \____\ \  \ \  \
+\ \_______\ \_______\____\_\  \ \_______\ \__\ \__\ \__\\ _\\ \_______\ \__\ \__\
+\|_______|\|_______|\_________\|_______|\|__|\|__|\|__|\|__|\|_______|\|__|\|__|
+\|_________|
 
 `
 
-// User-Agent header used in HTTP requests to mimic a browser.
-const DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0"
+const (
+	// GoSearch version number.
+	VERSION = "v2.0.0"
 
-// GoSearch version number.
-const VERSION = "v1.0.0"
+	// User-Agent header used in HTTP requests to mimic a browser.
+	DefaultUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:138.0) Gecko/20100101 Firefox/138.0"
+)
 
 var (
-
 	// tlsConfig defines the TLS configuration for secure HTTP requests.
 	tlsConfig = &tls.Config{
 		MinVersion: tls.VersionTLS12, // Minimum TLS version
@@ -74,54 +74,21 @@ var (
 	// CurrentTheme holds the active color theme for terminal output.
 	CurrentTheme = DarkTheme
 
-	// file mutext
+	// mu synchronizes file writes
 	mu sync.Mutex
+
+	// logger is the centralized logger
+	logger *ll.Logger
+
+	// serviceOrder defines the fixed order for service execution
+	serviceOrder = []string{
+		"websites",
+		"hudsonrock",
+		"breachdirectory",
+		"proxynova",
+		"domains",
+	}
 )
-
-// Theme defines color codes for terminal output styling.
-type Theme struct {
-	Reset     string // Reset formatting
-	Bold      string // Bold text
-	Underline string // Underlined text
-	Red       string // Red text
-	Green     string // Green text
-	Yellow    string // Yellow text
-	Blue      string // Blue text
-	Magenta   string // Magenta text
-	Cyan      string // Cyan text
-	White     string // White text
-	Gray      string // Gray text
-}
-
-// LightTheme defines colors optimized for light terminal backgrounds.
-var LightTheme = Theme{
-	Reset:     "\033[0m",
-	Bold:      "\033[1m",
-	Underline: "\033[4m",
-	Red:       "\033[31m", // Bright red for light background
-	Green:     "\033[32m", // Forest green
-	Yellow:    "\033[33m", // Dark yellow
-	Blue:      "\033[34m", // Navy blue
-	Magenta:   "\033[35m", // Dark magenta
-	Cyan:      "\033[36m", // Dark cyan
-	White:     "\033[37m", // Black for light background
-	Gray:      "\033[90m", // Dark gray
-}
-
-// DarkTheme defines colors optimized for dark terminal backgrounds.
-var DarkTheme = Theme{
-	Reset:     "\033[0m",
-	Bold:      "\033[1m",
-	Underline: "\033[4m",
-	Red:       "\033[91m", // Light red for dark background
-	Green:     "\033[92m", // Light green
-	Yellow:    "\033[93m", // Bright yellow
-	Blue:      "\033[94m", // Light blue
-	Magenta:   "\033[95m", // Light magenta
-	Cyan:      "\033[96m", // Light cyan
-	White:     "\033[97m", // White for dark background
-	Gray:      "\033[37m", // Light gray
-}
 
 // init sets the initial theme based on terminal background detection.
 func init() {
@@ -129,297 +96,362 @@ func init() {
 	CurrentTheme = detectTheme()
 }
 
-// Website represents a website configuration for searching usernames.
-type Website struct {
-	Name            string   `json:"name"`                   // Website name
-	BaseURL         string   `json:"base_url"`               // Base URL template
-	URLProbe        string   `json:"url_probe,omitempty"`    // Optional probe URL
-	FollowRedirects bool     `json:"follow_redirects"`       // Whether to follow HTTP redirects
-	UserAgent       string   `json:"user_agent,omitempty"`   // Custom User-Agent, if any
-	ErrorType       string   `json:"errorType"`              // Type of error checking
-	ErrorMsg        string   `json:"errorMsg,omitempty"`     // Expected error message for non-existent profiles
-	ErrorCode       int      `json:"errorCode,omitempty"`    // Expected HTTP status code for non-existent profiles
-	ResponseURL     string   `json:"response_url,omitempty"` // Expected response URL for existing profiles
-	Cookies         []Cookie `json:"cookies,omitempty"`      // Cookies to include in requests
-}
-
-// Data holds the list of websites to search.
-type Data struct {
-	Websites []Website `json:"websites"` // List of website configurations
-}
-
-// Cookie represents an HTTP cookie.
-type Cookie struct {
-	Name  string `json:"name"`  // Cookie name
-	Value string `json:"value"` // Cookie value
-}
-
-// Stealer represents data from an info-stealer compromise.
-type Stealer struct {
-	TotalCorporateServices int         `json:"total_corporate_services"` // Number of corporate services compromised
-	TotalUserServices      int         `json:"total_user_services"`      // Number of user services compromised
-	DateCompromised        string      `json:"date_compromised"`         // Date of compromise
-	StealerFamily          string      `json:"stealer_family"`           // Type of stealer malware
-	ComputerName           string      `json:"computer_name"`            // Name of compromised computer
-	OperatingSystem        string      `json:"operating_system"`         // Operating system of compromised computer
-	MalwarePath            string      `json:"malware_path"`             // Path of malware on compromised system
-	Antiviruses            interface{} `json:"antiviruses"`              // Antivirus software detected
-	IP                     string      `json:"ip"`                       // IP address of compromised system
-	TopPasswords           []string    `json:"top_passwords"`            // Commonly used passwords
-	TopLogins              []string    `json:"top_logins"`               // Commonly used logins
-}
-
-// HudsonRockResponse represents the response from HudsonRock's API.
-type HudsonRockResponse struct {
-	Message  string    `json:"message"`  // Response message
-	Stealers []Stealer `json:"stealers"` // List of stealer data
-}
-
-// WeakpassResponse represents the response from Weakpass API for hash cracking.
-type WeakpassResponse struct {
-	Type string `json:"type"` // Hash type
-	Hash string `json:"hash"` // Hash value
-	Pass string `json:"pass"` // Cracked password
-}
-
-// ProxyNova represents the response from ProxyNova API for compromised passwords.
-type ProxyNova struct {
-	Count int      `json:"count"` // Number of compromised credentials
-	Lines []string `json:"lines"` // List of credential pairs
-}
-
-// Color represents a colored string for terminal output.
-type Color string
-
-// String returns the colored string.
-func (c Color) String() string {
-	return string(c)
-}
-
-// Print prints the colored text without a newline.
-func (c Color) Print() {
-	fmt.Print(c)
-}
-
-// Println prints the colored text with a newline.
-func (c Color) Println() {
-	fmt.Println(c)
-}
-
-// Fprint writes the colored text to an io.Writer.
-func (c Color) Fprint(w io.Writer) {
-	fmt.Fprint(w, c)
-}
-
-// Fprintln writes the colored text to an io.Writer with a newline.
-func (c Color) Fprintln(w io.Writer) {
-	fmt.Fprintln(w, c)
-}
-
 // main is the entry point of the program, handling command-line arguments and orchestrating searches.
 func main() {
-	// Variables to store username and API key
-	var username string
-	var apikey string
-
-	// Define command-line flags
+	// Define flags
+	modeFlag := flag.String("mode", "cmd", "Run mode: cmd, web, or interactive")
 	usernameFlag := flag.String("u", "", "Username to search")
 	usernameFlagLong := flag.String("username", "", "Username to search")
+	servicesFlag := flag.String("services", "", "Comma-separated services to run (e.g., hudsonrock,proxynova)")
 	noFalsePositivesFlag := flag.Bool("no-false-positives", false, "Do not show false positives")
 	breachDirectoryAPIKey := flag.String("b", "", "Search Breach Directory with an API Key")
 	breachDirectoryAPIKeyLong := flag.String("breach-directory", "", "Search Breach Directory with an API Key")
+	portFlag := flag.String("port", "8080", "Port for web mode")
+	jsonOutput := flag.Bool("json", false, "Output results as JSON (cmd mode only)")
+	debugFlag := flag.Bool("debug", false, "Enable debug logging")
 
-	// Parse command-line flags
 	flag.Parse()
 
-	// Determine username from flags or arguments
-	if *usernameFlag != "" {
-		username = *usernameFlag
-	} else if *usernameFlagLong != "" {
-		username = *usernameFlagLong
+	// Initialize logger
+	logger = ll.New("")
+	if *debugFlag {
+		logger.Level(lx.LevelDebug)
 	} else {
-		if len(os.Args) > 1 {
-			username = os.Args[1]
-		} else {
-			fmt.Println("Usage: gosearch -u <username>\nIssues: https://github.com/ibnaleem/gosearch/issues")
-			os.Exit(1)
-		}
+		logger.Level(lx.LevelInfo)
 	}
 
-	// Delete any existing output file for the username
-	DeleteOldFile(username)
-	// Initialize a wait group for concurrent operations
-	var wg sync.WaitGroup
+	// Determine API key
+	apiKey := *breachDirectoryAPIKey
+	if apiKey == "" {
+		apiKey = *breachDirectoryAPIKeyLong
+	}
 
-	// Load website data from JSON
-	data, err := UnmarshalJSON()
+	// Get runners
+	runners, err := getRunners(*servicesFlag, apiKey, *noFalsePositivesFlag)
 	if err != nil {
-		fmt.Printf("Error unmarshalling json: %v\n", err)
+		fmt.Printf("Error selecting services: %v\n", err)
+		fmt.Println("Available services:", strings.Join(AvailableServices(), ", "))
+		os.Exit(1)
+	}
+	if len(runners) == 0 {
+		fmt.Println("No services selected")
 		os.Exit(1)
 	}
 
-	// Clear the terminal screen
-	screen.Clear()
-	// Display ASCII logo and version
-	fmt.Print(ASCII)
-	fmt.Println(VERSION)
-	// Print separator line
-	fmt.Println(strings.Repeat("⎯", 85))
-	// Display search parameters
-	fmt.Println(":: Username                              : ", username)
-	fmt.Println(":: Websites                              : ", len(data.Websites))
+	// Handle modes
+	switch *modeFlag {
+	case "web":
+		r := WebServer(runners)
+		fmt.Printf("Starting web server on :%s\n", *portFlag)
+		if err := http.ListenAndServe(":"+*portFlag, r); err != nil {
+			logger.Errorf("Web server failed: %v", err)
+			fmt.Printf("Web server failed: %v\n", err)
+			os.Exit(1)
+		}
 
-	// Display false positives setting if enabled
-	if *noFalsePositivesFlag {
-		fmt.Println(":: No False Positives                    : ", *noFalsePositivesFlag)
-	}
-
-	// Print separator line
-	fmt.Println(strings.Repeat("⎯", 85))
-	fmt.Println()
-
-	// Warn about false positives if not disabled
-	if !*noFalsePositivesFlag {
-		fmt.Println("[!] A yellow link indicates that I was unable to verify whether the username exists on the platform.")
-	}
-
-	// Record start time for performance measurement
-	start := time.Now()
-
-	// Start searching websites concurrently
-	wg.Add(len(data.Websites))
-	go Search(data, username, *noFalsePositivesFlag, &wg)
-	wg.Wait()
-
-	fmt.Println()
-	fmt.Println()
-
-	// Search HudsonRock's database
-	wg.Add(1)
-	WriteToFile(username, strings.Repeat("⎯", 85))
-	Yellow("[*] Searching HudsonRock's Cybercrime Intelligence Database...").Println()
-	go HudsonRock(username, &wg)
-	wg.Wait()
-
-	// Search Breach Directory if API key is provided
-	if *breachDirectoryAPIKey != "" || *breachDirectoryAPIKeyLong != "" {
-		if *breachDirectoryAPIKey != "" {
-			apikey = *breachDirectoryAPIKey
+	case "cmd":
+		var username string
+		if *usernameFlag != "" {
+			username = *usernameFlag
+		} else if *usernameFlagLong != "" {
+			username = *usernameFlagLong
+		} else if len(os.Args) > 1 && !strings.HasPrefix(os.Args[1], "-") {
+			username = os.Args[1]
 		} else {
-			apikey = *breachDirectoryAPIKeyLong
+			fmt.Println("Usage: gosearch [username] [-u <username>] [-no-false-positives] [-b <apikey>] [--breach-directory <apikey>]")
+			fmt.Println("For web mode, use: gosearch -mode web [-port <port>]")
+			fmt.Println("For interactive mode, use: gosearch -mode interactive")
+			fmt.Println("Available services:", strings.Join(AvailableServices(), ", "))
+			os.Exit(1)
+		}
+
+		DeleteOldFile(username)
+		data, err := UnmarshalJSON()
+		if err != nil {
+			logger.Errorf("Error unmarshalling json: %v", err)
+			fmt.Printf("Error unmarshalling json: %v\n", err)
+			os.Exit(1)
+		}
+
+		screen.Clear()
+		fmt.Print(strings.TrimSpace(ASCII))
+		fmt.Println(VERSION)
+		fmt.Println(strings.Repeat("⎯", 85))
+		fmt.Println(":: Username                              : ", username)
+		fmt.Println(":: Websites                              : ", len(data.Websites))
+		if *servicesFlag != "" {
+			fmt.Println(":: Services                              : ", *servicesFlag)
+		}
+		if *noFalsePositivesFlag {
+			fmt.Println(":: No False Positives                    : ", *noFalsePositivesFlag)
+		}
+		fmt.Println(strings.Repeat("⎯", 85))
+		fmt.Println()
+		if !*noFalsePositivesFlag {
+			fmt.Println("[!] A yellow link indicates that I was unable to verify whether the username exists on the platform.")
+		}
+
+		start := time.Now()
+		resultsChan := runSearches(username, runners)
+
+		if *jsonOutput {
+			results := make([]Response, 0, len(runners))
+			for res := range resultsChan {
+				results = append(results, res)
+			}
+			enc := sonic.ConfigDefault.NewEncoder(os.Stdout)
+			if err := enc.Encode(results); err != nil {
+				logger.Errorf("Failed to encode JSON: %v", err)
+				fmt.Fprintf(os.Stderr, "Failed to encode JSON: %v\n", err)
+				os.Exit(1)
+			}
+			return
+		}
+
+		for res := range resultsChan {
+			fmt.Println()
+			if res.Error != "" {
+				Redf("[%s] Error: %s", res.Service, res.Error).Println()
+				if err := WriteToFile(username, fmt.Sprintf("[%s] Error: %s\n", res.Service, res.Error)); err != nil {
+					logger.Errorf("Failed to write error to file: %v", err)
+				}
+				continue
+			}
+			if res.Found {
+				Greenf("[%s] Found results", res.Service).Println()
+				if res.Data != nil {
+					table := tablewriter.NewTable(os.Stdout, tablewriter.WithHeaderConfig(tw.CellConfig{
+						Formatting: tw.CellFormatting{AutoFormat: tw.Off},
+					}),
+						tablewriter.WithColumnMax(80),
+					)
+					res.Data.RenderTable(table)
+					if err := table.Render(); err != nil {
+						logger.Errorf("Table render failed: %v", err)
+					}
+					if err := WriteToFile(username, res.Data.String()); err != nil {
+						logger.Errorf("Failed to write results to file: %v", err)
+					}
+				}
+			} else {
+				Greenf("[%s] No results found", res.Service).Println()
+				if err := WriteToFile(username, fmt.Sprintf("[%s] No results found\n", res.Service)); err != nil {
+					logger.Errorf("Failed to write no-results to file: %v", err)
+				}
+			}
+			if err := WriteToFile(username, strings.Repeat("⎯", 85)+"\n"); err != nil {
+				logger.Errorf("Failed to write separator to file: %v", err)
+			}
 		}
 
 		fmt.Println()
-		fmt.Println()
+		elapsed := time.Since(start)
+		table := tablewriter.NewTable(os.Stdout, tablewriter.WithRenderer(renderer.NewBlueprint(tw.Rendition{Borders: tw.BorderNone})))
+		table.Append(Bold("Number of profiles found"), Red(count.Load()))
+		table.Append(Bold("Total time taken"), Green(elapsed))
+		if err := table.Render(); err != nil {
+			logger.Errorf("Table render failed: %v", err)
+		}
 
-		//fmt.Println(strings.Repeat("⎯", 85))
-		//strings.Repeat("⎯", 85)
-		wg.Add(1)
-		go SearchBreachDirectory(username, apikey, &wg)
-		wg.Wait()
+		if err := WriteToFile(username, ":: Number of profiles found              : "+strconv.Itoa(int(count.Load()))+"\n"); err != nil {
+			logger.Errorf("Failed to write profile count to file: %v", err)
+		}
+		if err := WriteToFile(username, ":: Total time taken                      : "+elapsed.String()+"\n"); err != nil {
+			logger.Errorf("Failed to write elapsed time to file: %v", err)
+		}
+
+	case "interactive":
+		runInteractiveMode(runners)
+
+	default:
+		fmt.Printf("Unknown mode: %s\n", *modeFlag)
+		os.Exit(1)
+	}
+}
+
+// AvailableServices returns the list of supported service names
+func AvailableServices() []string {
+	services := make([]string, 0, len(RunnerRegistry))
+	for name := range RunnerRegistry {
+		services = append(services, name)
+	}
+	sort.Strings(services)
+	return services
+}
+
+// getRunners selects runners based on user input, preserving default behavior
+func getRunners(servicesFlag string, apiKey string, noFalsePositives bool) ([]Runner, error) {
+	runnerMap := map[string]Runner{
+		"hudsonrock":      HudsonRockRunner{},
+		"proxynova":       ProxyNovaRunner{},
+		"breachdirectory": BreachDirectoryRunner{APIKey: apiKey},
+		"domains":         DomainsRunner{},
+		"websites":        WebsitesRunner{NoFalsePositives: noFalsePositives},
 	}
 
-	fmt.Println()
-	fmt.Println()
-
-	// Search ProxyNova for compromised passwords
-	wg.Add(1)
-	// fmt.Println(strings.Repeat("⎯", 85))
-	WriteToFile(username, strings.Repeat("⎯", 85))
-	go SearchProxyNova(username, &wg)
-	wg.Wait()
-
-	fmt.Println()
-	fmt.Println()
-
-	// Search for domains associated with the username
-	domains := BuildDomains(username)
-	//fmt.Println(strings.Repeat("⎯", 85))
-	wg.Add(1)
-	go SearchDomains(username, domains, &wg)
-	wg.Wait()
-
-	fmt.Println()
-	fmt.Println()
-
-	// Calculate and display elapsed time
-	elapsed := time.Since(start)
-
-	table := tablewriter.NewTable(os.Stdout, tablewriter.WithRenderer(renderer.NewBlueprint(tw.Rendition{Borders: tw.BorderNone})))
-	table.Append(Bold("Number of profiles found"), Red(count.Load()))
-	table.Append(Bold("Total time taken"), Green(elapsed))
-	if err := table.Render(); err != nil {
-		log.Printf("table render failed: %v", err)
+	// Validate API key for breachdirectory
+	if strings.Contains(strings.ToLower(servicesFlag), "breachdirectory") || (servicesFlag == "" && apiKey != "") {
+		if apiKey == "" || len(apiKey) < 8 { // Basic length check; adjust based on actual API key format
+			logger.Warnf("Invalid or missing BreachDirectory API key; skipping service")
+			if servicesFlag != "" {
+				servicesFlag = strings.ReplaceAll(servicesFlag, "breachdirectory", "")
+				servicesFlag = strings.ReplaceAll(servicesFlag, ",,", ",")
+				servicesFlag = strings.Trim(servicesFlag, ",")
+			}
+		}
 	}
-	// fmt.Println(strings.Repeat("⎯", 85))
 
-	WriteToFile(username, ":: Number of profiles found              : "+strconv.Itoa(int(count.Load())))
-	WriteToFile(username, ":: Total time taken                      : "+elapsed.String())
+	selectedServices := serviceOrder
+	if servicesFlag != "" {
+		requested := strings.Split(strings.ToLower(servicesFlag), ",")
+		seen := make(map[string]bool)
+		selectedServices = nil
+		for _, s := range requested {
+			s = strings.TrimSpace(s)
+			if s == "" || seen[s] {
+				continue
+			}
+			if _, ok := runnerMap[s]; !ok {
+				return nil, fmt.Errorf("unknown service: %s", s)
+			}
+			if s == "breachdirectory" && apiKey == "" {
+				logger.Warnf("BreachDirectory skipped due to missing API key")
+				continue
+			}
+			seen[s] = true
+			// Add service in original order
+			for _, ordered := range serviceOrder {
+				if ordered == s && !contains(selectedServices, s) {
+					selectedServices = append(selectedServices, s)
+				}
+			}
+		}
+		if len(selectedServices) == 0 {
+			return nil, fmt.Errorf("no valid services selected")
+		}
+	} else if apiKey == "" {
+		// Exclude breachdirectory if no API key
+		selectedServices = []string{"websites", "hudsonrock", "proxynova", "domains"}
+	}
+
+	runners := make([]Runner, 0, len(selectedServices))
+	for _, s := range selectedServices {
+		runner := runnerMap[s]
+		runners = append(runners, runner)
+	}
+	return runners, nil
+}
+
+// validateUsername checks if a username is valid for web requests
+func validateUsername(username string) error {
+	if username == "" {
+		return fmt.Errorf("username cannot be empty")
+	}
+	if len(username) > 50 {
+		return fmt.Errorf("username too long (max 50 characters)")
+	}
+	usernameRegex := regexp.MustCompile(`^[a-zA-Z0-9_]+$`)
+	if !usernameRegex.MatchString(username) {
+		return fmt.Errorf("username contains invalid characters (only alphanumeric and underscores allowed)")
+	}
+	return nil
+}
+
+// WebServer sets up the Chi router with middleware
+func WebServer(runners []Runner) *chi.Mux {
+	r := chi.NewRouter()
+	r.Use(middleware.Logger)
+	r.Use(middleware.Recoverer)
+	r.Use(httprate.LimitByIP(10, time.Second)) // 10 requests per second per IP
+	r.Get("/search/{username}", func(w http.ResponseWriter, r *http.Request) {
+		username := chi.URLParam(r, "username")
+		logger.Debugf("Received web request for username: %s", username)
+		if err := validateUsername(username); err != nil {
+			logger.Errorf("Invalid username: %s (%v)", username, err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		resultsChan := runSearches(username, runners)
+		results := make([]Response, 0, len(runners))
+		for res := range resultsChan {
+			results = append(results, res)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		enc := sonic.ConfigDefault.NewEncoder(w)
+		if err := enc.Encode(results); err != nil {
+			logger.Errorf("Failed to encode JSON response: %v", err)
+			http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+		}
+	})
+	return r
 }
 
 // UnmarshalJSON fetches and parses the website configuration from a remote JSON file.
 func UnmarshalJSON() (Data, error) {
-	// GoSearch relies on data.json to determine the websites to search for.
-	// Instead of forcing users to manually download the data.json file, we will fetch the latest version from the repository.
-	// Therefore, we will do the following:
-	// 1. Delete the existing data.json file if it exists as it will be outdated in the future
-	// 2. Read the latest data.json file from the repository
-	// Bonus: it does not download the data.json file, it just reads it from the repository.
-
-	// Delete existing data.json file
-	err := os.Remove("data.json")
-	if err != nil && !os.IsNotExist(err) {
-		return Data{}, fmt.Errorf("error deleting old data.json: %w", err)
-	}
-
-	// Fetch JSON from repository
 	url := "https://raw.githubusercontent.com/ibnaleem/gosearch/refs/heads/main/data.json"
+	logger.Debugf("Fetching data.json from %s", url)
+	start := time.Now()
 	resp, err := http.Get(url)
 	if err != nil {
+		logger.Errorf("Error downloading data.json: %v", err)
 		return Data{}, fmt.Errorf("error downloading data.json: %w", err)
 	}
 	defer resp.Body.Close()
+	logger.Debugf("Received data.json response in %v, status: %s", time.Since(start), resp.Status)
 
-	// Check HTTP status
 	if resp.StatusCode != http.StatusOK {
+		logger.Errorf("Failed to download data.json, status code: %d", resp.StatusCode)
 		return Data{}, fmt.Errorf("failed to download data.json, status code: %d", resp.StatusCode)
 	}
 
-	// Read response body
 	jsonData, err := io.ReadAll(resp.Body)
 	if err != nil {
+		logger.Errorf("Error reading downloaded content: %v", err)
 		return Data{}, fmt.Errorf("error reading downloaded content: %w", err)
 	}
+	logger.Debugf("Downloaded data.json, size: %d bytes", len(jsonData))
 
-	// Unmarshal JSON into Data struct
 	var data Data
 	err = sonic.Unmarshal(jsonData, &data)
 	if err != nil {
+		logger.Errorf("Error unmarshalling JSON: %v", err)
 		return Data{}, fmt.Errorf("error unmarshalling JSON: %w", err)
 	}
-
+	logger.Debugf("Successfully loaded %d websites from data.json", len(data.Websites))
 	return data, nil
 }
 
 // WriteToFile appends content to a file named after the username.
-func WriteToFile(username string, content string) {
+func WriteToFile(username string, content string) error {
 	mu.Lock()
 	defer mu.Unlock()
-
-	// Construct filename
 	filename := fmt.Sprintf("%s.txt", username)
-
-	// Open file in append mode, create if it doesn't exist
 	f, err := os.OpenFile(filename, os.O_APPEND|os.O_WRONLY|os.O_CREATE, os.ModePerm)
 	if err != nil {
-		log.Fatal(err)
+		logger.Errorf("Error opening file %s: %v", filename, err)
+		return fmt.Errorf("error opening file %s: %w", filename, err)
 	}
 	defer f.Close()
-
-	// Write content to file
 	if _, err = f.WriteString(content); err != nil {
-		log.Fatal(err)
+		logger.Errorf("Error writing to file %s: %v", filename, err)
+		return fmt.Errorf("error writing to file %s: %w", filename, err)
 	}
+	logger.Debugf("Wrote to file %s: %s", filename, content)
+	return nil
+}
+
+// BuildDomains generates a list of potential domains using the username and common TLDs.
+func BuildDomains(username string) []string {
+	tlds := []string{
+		".com", ".net", ".org", ".biz", ".info", ".name", ".pro", ".cat", ".co",
+		".me", ".io", ".tech", ".dev", ".app", ".shop", ".fail", ".xyz", ".blog",
+		".portfolio", ".store", ".online", ".about", ".space", ".lol", ".fun", ".social",
+	}
+	var domains []string
+	for _, tld := range tlds {
+		domains = append(domains, username+tld)
+	}
+	return domains
 }
 
 // BuildURL constructs a URL by replacing the placeholder with the username.
@@ -427,938 +459,187 @@ func BuildURL(baseURL, username string) string {
 	return strings.Replace(baseURL, "{}", username, 1)
 }
 
-// HudsonRock searches HudsonRock's database for info-stealer compromises.
-func HudsonRock(username string, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	// Construct API URL
-	url := fmt.Sprintf("https://cavalier.hudsonrock.com/api/json/v2/osint-tools/search-by-username?username=%s", username)
-
-	// Send HTTP request
-	resp, err := http.Get(url)
-	if err != nil {
-		Redf("Error fetching HudsonRock data:").Print()
-		White(" " + err.Error()).Println()
-		return
-	}
-	defer resp.Body.Close()
-
-	// Read response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		Red("Error reading response:").Print()
-		White(" " + err.Error()).Println()
-		return
-	}
-
-	// Parse JSON response
-	var response HudsonRockResponse
-	if err := sonic.Unmarshal(body, &response); err != nil {
-		Red("Error parsing JSON:").Print()
-		White(" " + err.Error()).Println()
-		return
-	}
-
-	// Check if no compromises were found
-	if response.Message == "This username is not associated with a computer infected by an info-stealer. Visit https://www.hudsonrock.com/free-tools to discover additional free tools and Infostealers related data." {
-		Green("✓ No info-stealer association found").Println()
-		WriteToFile(username, ":: No info-stealer association found")
-		return
-	}
-
-	// Display warning for detected compromises
-	Red("‼ Info-stealer compromise detected").Println()
-	Yellow("  All credentials on this computer may be exposed").Println()
-
-	// Initialize table for terminal output
-	table := tablewriter.NewTable(os.Stdout, tablewriter.WithHeaderConfig(tw.CellConfig{
-		Formatting: tw.CellFormatting{
-			AutoFormat: tw.Off,
-		},
-	}))
-	table.Header([]any{
-		Blue("#"),
-		Blue("Stealer"),
-		Blue("Date"),
-		Blue("Computer"),
-		Blue("Passwords"),
-	})
-
-	// Buffer for file output
-	var fileContent strings.Builder
-
-	// Process each stealer entry
-	for i, stealer := range response.Stealers {
-		// Format antiviruses
-		var avs string
-		switch v := stealer.Antiviruses.(type) {
-		case string:
-			avs = v
-		case []interface{}:
-			parts := make([]string, len(v))
-			for i, av := range v {
-				parts[i] = fmt.Sprint(av)
-			}
-			avs = strings.Join(parts, ", ")
-		}
-
-		// Highlight computer name if valid
-		computerName := stealer.ComputerName
-		if !strings.EqualFold(strings.TrimSpace(computerName), "Not Found") {
-			computerName = Red(computerName).String()
-		}
-		// Add to terminal table
-		table.Append([]string{
-			fmt.Sprintf("%d", i+1),
-			stealer.StealerFamily,
-			formatStealerDate(stealer.DateCompromised),
-			computerName,
-			strings.Join(stealer.TopPasswords, "\n"),
-		})
-
-		// Add to file content
-		fileContent.WriteString(fmt.Sprintf("[-] Stealer #%d\n", i+1))
-		fileContent.WriteString(fmt.Sprintf(":: Family: %s\n", stealer.StealerFamily))
-		fileContent.WriteString(fmt.Sprintf(":: Date: %s\n", stealer.DateCompromised))
-		fileContent.WriteString(fmt.Sprintf(":: Computer: %s\n", stealer.ComputerName))
-		fileContent.WriteString(fmt.Sprintf(":: OS: %s\n", stealer.OperatingSystem))
-		fileContent.WriteString(fmt.Sprintf(":: Path: %s\n", stealer.MalwarePath))
-		fileContent.WriteString(fmt.Sprintf(":: AV: %s\n", avs))
-		fileContent.WriteString(fmt.Sprintf(":: IP: %s\n", stealer.IP))
-
-		fileContent.WriteString(":: Passwords:\n")
-		for _, p := range stealer.TopPasswords {
-			fileContent.WriteString(fmt.Sprintf("   %s\n", p))
-		}
-
-		fileContent.WriteString(":: Logins:\n")
-		for _, l := range stealer.TopLogins {
-			fileContent.WriteString(fmt.Sprintf("   %s\n", l))
-		}
-		fileContent.WriteString("\n")
-	}
-
-	// Render table to terminal
-	if err := table.Render(); err != nil {
-		log.Printf("table render failed: %v", err)
-	}
-
-	// Write all content to file
-	WriteToFile(username, fileContent.String())
-}
-
-// BuildDomains generates a list of potential domains using the username and common TLDs.
-func BuildDomains(username string) []string {
-	// List of common top-level domains
-	tlds := []string{
-		".com",
-		".net",
-		".org",
-		".biz",
-		".info",
-		".name",
-		".pro",
-		".cat",
-		".co",
-		".me",
-		".io",
-		".tech",
-		".dev",
-		".app",
-		".shop",
-		".fail",
-		".xyz",
-		".blog",
-		".portfolio",
-		".store",
-		".online",
-		".about",
-		".space",
-		".lol",
-		".fun",
-		".social",
-	}
-
-	// Generate domains by appending TLDs to username
-	var domains []string
-	for _, tld := range tlds {
-		domains = append(domains, username+tld)
-	}
-
-	return domains
-}
-
-// SearchDomains checks if domains associated with the username exist.
-func SearchDomains(username string, domains []string, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	// Initialize HTTP client
-	client := &http.Client{}
-	Yellow("[*] Searching ", len(domains), " domains with the username ", username, "...").Println()
-
-	// Track number of found domains
-	domainCount := 0
-	// Initialize table for output
-	table := tablewriter.NewWriter(os.Stdout)
-	table.Header("NO", "DOMAIN", "STATUS")
-
-	// Counter for table rows
-	x := 0
-	// Check each domain
-	for _, domain := range domains {
-		url := "http://" + domain
-
-		// Create HTTP request
-		req, err := http.NewRequest(http.MethodGet, url, nil)
-		if err != nil {
-			fmt.Printf("Error creating request for %s: %v\n", domain, err)
-			continue
-		}
-		// Set request headers
-		req.Header.Set("User-Agent", DefaultUserAgent)
-		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-		req.Header.Set("Accept-Language", "en-US,en;q=0.5")
-		req.Header.Set("Accept-Encoding", "gzip, deflate, br")
-		req.Header.Set("Connection", "keep-alive")
-		req.Header.Set("Upgrade-Insecure-Requests", "1")
-		req.Header.Set("Sec-Fetch-Dest", "document")
-		req.Header.Set("Sec-Fetch-Mode", "navigate")
-		req.Header.Set("Sec-Fetch-Site", "none")
-		req.Header.Set("Sec-Fetch-User", "?1")
-		req.Header.Set("Cache-Control", "max-age=0")
-
-		// Send request
-		resp, err := client.Do(req)
-		if err != nil {
-			var netErr net.Error
-			ok := errors.As(err, &netErr)
-			// Check for specific network errors indicating non-existent domains
-			noSuchHostError := strings.Contains(err.Error(), "no such host")
-			networkTimeoutError := ok && netErr.Timeout()
-
-			if !noSuchHostError && !networkTimeoutError {
-				fmt.Printf("Error sending request for %s: %v\n", domain, err)
-			}
-
-			continue
-		}
-		defer resp.Body.Close()
-
-		// Check if domain exists (HTTP 200)
-		if resp.StatusCode == http.StatusOK {
-			x++
-			table.Append(x, domain, Green(http.StatusOK))
-			WriteToFile(username, "[+] 200 OK: "+domain)
-			domainCount++
-		}
-	}
-
-	// Render table
-	if err := table.Render(); err != nil {
-		log.Printf("table render failed: %v", err)
-	}
-	// Display results
-	if domainCount > 0 {
-		Greenf("[+] Found %d domains with the username %s", domainCount, username).Println()
-		WriteToFile(username, "[+] Found "+strconv.Itoa(domainCount)+" domains with the username: "+username)
-	} else {
-		Redf("[-] No domains found with the username %s", username).Println()
-		WriteToFile(username, "[-] No domains found with the username: "+username)
-	}
-}
-
-// SearchProxyNova checks ProxyNova for compromised passwords associated with the username.
-func SearchProxyNova(username string, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	Yellow("[*] Searching ", username, " on ProxyNova for any compromised passwords...").Println()
-
-	// Initialize HTTP client
-	client := &http.Client{}
-
-	// Create request
-	req, err := http.NewRequest(http.MethodGet, "https://api.proxynova.com/comb?query="+username, nil)
-	if err != nil {
-		fmt.Printf("Error creating request: %v\n", err)
-		return
-	}
-
-	// Send request
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Printf("Error sending request: %v\n", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	// Read response body
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Println("Error reading response in SearchProxyNova function:", err)
-		return
-	}
-
-	// Parse JSON response
-	var response ProxyNova
-	err = sonic.Unmarshal(body, &response)
-	if err != nil {
-		fmt.Println("Error parsing JSON in SearchProxyNova function:", err)
-		return
-	}
-
-	// Check if compromised credentials were found
-	if response.Count > 0 {
-		// Initialize table
-		table := tablewriter.NewTable(os.Stdout)
-		table.Header("No", "Email", "Password")
-		Greenf("[+] Found %d compromised passwords for %s:\n", response.Count, username).Println()
-		// Process each credential
-		for i, element := range response.Lines {
-			parts := strings.Split(element, ":")
-			if len(parts) == 2 {
-				email := parts[0]
-				password := parts[1]
-				table.Append(i+1, Green(email), Red(password))
-				WriteToFile(username, "[+] Email: "+email+"\n"+"[+] Password: "+password+"\n\n")
-			}
-		}
-		if err := table.Render(); err != nil {
-			log.Printf("table render failed: %v", err)
-		}
-	} else {
-		Red("[-] No compromised passwords found for ", username, ".").Println()
-	}
-}
-
-// SearchBreachDirectory searches Breach Directory for compromised credentials using an API key.
-func SearchBreachDirectory(username string, apikey string, wg *sync.WaitGroup) {
-	defer wg.Done()
-
-	// Initialize Breach Directory client
-	client, err := gobreach.NewBreachDirectoryClient(apikey)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	Yellow("[*] Searching ", username, " on Breach Directory for any compromised passwords...").Println()
-
-	// Search for breaches
-	response, err := client.Search(username)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	// Check if no breaches were found
-	if response.Found == 0 {
-		Redf("[-] No breaches found for %s.", username).Println()
-		WriteToFile(username, "[-] No breaches found on Breach Directory for: "+username)
-	}
-
-	// Display found breaches
-	Greenf("[+] Found %d breaches for %s:\n", response.Found, username).Println()
-	for _, entry := range response.Result {
-		// Attempt to crack hash
-		pass := CrackHash(entry.Hash)
-		if pass != "" {
-			Green("[+] Password:", pass).Println()
-			WriteToFile(username, "[+] Password: "+pass)
-		} else {
-			Green("[+] Password:", entry.Password).Println()
-			WriteToFile(username, "[+] Password: "+entry.Password)
-		}
-
-		Green("[+] SHA1:", entry.Sha1).Println()
-		Green("[+] Source:", entry.Sources).Println()
-		Green("[+] SHA1:", entry.Sha1)
-		WriteToFile(username, "[+] Source: "+entry.Sources)
-	}
-}
-
 // CrackHash attempts to crack a password hash using the Weakpass API.
 func CrackHash(hash string) string {
-	// Initialize HTTP client
 	client := &http.Client{}
-	// Construct API URL
 	url := fmt.Sprintf("https://weakpass.com/api/v1/search/%s.json", hash)
-
-	// Create request
+	logger.Debugf("Sending GET request to Weakpass API: %s", url)
+	start := time.Now()
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
-		fmt.Printf("Error creating request in function CrackHash: %v\n", err)
+		logger.Errorf("Error creating Weakpass request: %v", err)
 		return ""
 	}
-
-	// Set request headers
 	req.Header.Set("User-Agent", DefaultUserAgent)
 	req.Header.Set("accept:", "application/json")
-
-	// Send request
 	res, err := client.Do(req)
 	if err != nil {
-		fmt.Printf("Error fetching response in function CrackHash: %v\n", err)
+		logger.Errorf("Error fetching Weakpass response: %v", err)
 		return ""
 	}
 	defer res.Body.Close()
-
-	// Read response body
+	logger.Debugf("Received Weakpass response in %v, status: %s", time.Since(start), res.Status)
 	jsonData, err := io.ReadAll(res.Body)
 	if err != nil {
-		fmt.Printf("Error reading response JSON: %v\n", err)
+		logger.Errorf("Error reading Weakpass response JSON: %v", err)
 		return ""
 	}
-
-	// Parse JSON response
+	logger.Debugf("Weakpass response size: %d bytes", len(jsonData))
 	var weakpass WeakpassResponse
 	err = sonic.Unmarshal(jsonData, &weakpass)
 	if err != nil {
-		fmt.Printf("Error unmarshalling JSON: %v\n", err)
+		logger.Errorf("Error unmarshalling Weakpass JSON: %v", err)
 		return ""
 	}
-	// Return cracked password
+	if weakpass.Pass != "" {
+		logger.Debugf("Successfully cracked hash %s to password: %s", hash, weakpass.Pass)
+	}
 	return weakpass.Pass
-}
-
-// MakeRequestWithResponseURL checks for profile existence by comparing the response URL.
-func MakeRequestWithResponseURL(website Website, url string, username string) {
-	// Some websites always return a 200 for existing and non-existing profiles.
-	// If we do not follow redirects, we could get a 301 for existing profiles and 302 for non-existing profiles.
-	// That is why we have the follow_redirects in our website struct.
-	// However, sometimes the website returns 301 for existing profiles and non-existing profiles.
-	// This means even if we do not follow redirects, we still get false positives.
-	// To mitigate this, we can examine the response url to check for non-existing profiles.
-	// Usually, a response url pointing to where the profile should be is returned for existing profiles.
-	// If the response url is not pointing to where the profile should be, then the profile does not exist.
-
-	// Initialize HTTP client with timeout and transport settings
-	client := &http.Client{
-		Timeout: 120 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: tlsConfig,
-			Proxy:           http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-				DualStack: true,
-			}).DialContext,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
-		Jar: nil,
-	}
-
-	// Disable redirects if specified
-	if !website.FollowRedirects {
-		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		}
-	}
-
-	// Set User-Agent
-	userAgent := DefaultUserAgent
-	if website.UserAgent != "" {
-		userAgent = website.UserAgent
-	}
-
-	// Create request
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		fmt.Printf("Error creating request in function MakeRequestWithResponseURL: %v\n", err)
-		return
-	}
-
-	// Set request headers
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
-	req.Header.Set("Sec-Fetch-Dest", "document")
-	req.Header.Set("Sec-Fetch-Mode", "navigate")
-	req.Header.Set("Sec-Fetch-Site", "none")
-	req.Header.Set("Sec-Fetch-User", "?1")
-	req.Header.Set("Cache-Control", "max-age=0")
-
-	// Add cookies if specified
-	if website.Cookies != nil {
-		for _, cookie := range website.Cookies {
-			cookieObj := &http.Cookie{
-				Name:  cookie.Name,
-				Value: cookie.Value,
-			}
-			req.AddCookie(cookieObj)
-		}
-	}
-
-	// Send request
-	res, err := client.Do(req)
-	if err != nil {
-		return
-	}
-	defer res.Body.Close()
-
-	// Check for error status codes
-	if res.StatusCode >= 400 {
-		return
-	}
-
-	// Compare response URL with expected URL
-	formattedResponseURL := BuildURL(website.ResponseURL, username)
-	if !(res.Request.URL.String() == formattedResponseURL) {
-		url = BuildURL(website.BaseURL, username)
-		Green("[+]", website.Name, ":", url).Println()
-		WriteToFile(username, url+"\n")
-		count.Add(1)
-	}
-}
-
-// MakeRequestWithErrorCode checks for profile existence by comparing HTTP status codes.
-func MakeRequestWithErrorCode(website Website, url string, username string) {
-	// Initialize HTTP client
-	client := &http.Client{
-		Timeout: 120 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: tlsConfig,
-			Proxy:           http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-				DualStack: true,
-			}).DialContext,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
-		Jar: nil,
-	}
-
-	// Disable redirects if specified
-	if !website.FollowRedirects {
-		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		}
-	}
-
-	// Set User-Agent
-	userAgent := DefaultUserAgent
-	if website.UserAgent != "" {
-		userAgent = website.UserAgent
-	}
-
-	// Create request
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		fmt.Printf("Error creating request in function MakeRequestWithErrorCode: %v\n", err)
-		return
-	}
-
-	// Set request headers
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
-	req.Header.Set("Sec-Fetch-Dest", "document")
-	req.Header.Set("Sec-Fetch-Mode", "navigate")
-	req.Header.Set("Sec-Fetch-Site", "none")
-	req.Header.Set("Sec-Fetch-User", "?1")
-	req.Header.Set("Cache-Control", "max-age=0")
-
-	// Add cookies if specified
-	if website.Cookies != nil {
-		for _, cookie := range website.Cookies {
-			cookieObj := &http.Cookie{
-				Name:  cookie.Name,
-				Value: cookie.Value,
-			}
-			req.AddCookie(cookieObj)
-		}
-	}
-
-	// Send request
-	res, err := client.Do(req)
-	if err != nil {
-		return
-	}
-	defer res.Body.Close()
-
-	// Check for error status codes
-	if res.StatusCode >= 400 {
-		return
-	}
-
-	// Check if status code differs from error code
-	if res.StatusCode != website.ErrorCode {
-		url = BuildURL(website.BaseURL, username)
-		Green("[+] ", website.Name, ":", url).Println()
-		WriteToFile(username, url+"\n")
-		count.Add(1)
-	}
-}
-
-// MakeRequestWithErrorMsg checks for profile existence by searching for an error message in the response body.
-func MakeRequestWithErrorMsg(website Website, url string, username string) {
-	// Initialize HTTP client
-	client := &http.Client{
-		Timeout: 120 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: tlsConfig,
-			Proxy:           http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-				DualStack: true,
-			}).DialContext,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
-		Jar: nil,
-	}
-
-	// Disable redirects if specified
-	if !website.FollowRedirects {
-		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		}
-	}
-
-	// Set User-Agent
-	userAgent := DefaultUserAgent
-	if website.UserAgent != "" {
-		userAgent = website.UserAgent
-	}
-
-	// Create request
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		fmt.Printf("Error creating request in function MakeRequestWithErrorMsg: %v\n", err)
-		return
-	}
-
-	// Set request headers
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
-	req.Header.Set("Sec-Fetch-Dest", "document")
-	req.Header.Set("Sec-Fetch-Mode", "navigate")
-	req.Header.Set("Sec-Fetch-Site", "none")
-	req.Header.Set("Sec-Fetch-User", "?1")
-	req.Header.Set("Cache-Control", "max-age=0")
-
-	// Add cookies if specified
-	if website.Cookies != nil {
-		for _, cookie := range website.Cookies {
-			cookieObj := &http.Cookie{
-				Name:  cookie.Name,
-				Value: cookie.Value,
-			}
-			req.AddCookie(cookieObj)
-		}
-	}
-
-	// Send request
-	res, err := client.Do(req)
-	if err != nil {
-		return
-	}
-	// Handle response body compression
-	var reader io.ReadCloser
-	switch res.Header.Get("Content-Encoding") {
-	case "gzip":
-		gzReader, err := gzip.NewReader(res.Body)
-		if err != nil {
-			fmt.Printf("Error creating gzip reader: %v\n", err)
-			return
-		}
-		reader = gzReader
-	case "deflate":
-		zlibReader, err := zlib.NewReader(res.Body)
-		if err != nil {
-			fmt.Printf("Error creating deflate reader: %v\n", err)
-			return
-		}
-		reader = zlibReader
-	case "br":
-		reader = io.NopCloser(brotli.NewReader(res.Body))
-	default:
-		reader = res.Body
-	}
-	defer res.Body.Close()
-
-	// Check for error status codes
-	if res.StatusCode >= 400 {
-		return
-	}
-
-	// Read response body
-	body, err := io.ReadAll(reader)
-	if err != nil {
-		fmt.Printf("Error reading response body: %v\n", err)
-		return
-	}
-
-	// Check for error message
-	bodyStr := string(body)
-	if !strings.Contains(bodyStr, website.ErrorMsg) {
-		url = BuildURL(website.BaseURL, username)
-		Green("[+] ", website.Name, ":", url).Println()
-		WriteToFile(username, url+"\n")
-		count.Add(1)
-	}
-}
-
-// MakeRequestWithProfilePresence checks for profile existence by searching for a profile indicator in the response body.
-func MakeRequestWithProfilePresence(website Website, url string, username string) {
-	// Some websites have an indicator that a profile exists
-	// but do not have an indicator when a profile does not exist.
-	// If a profile indicator is not found, we can assume that the profile does not exist.
-
-	// Initialize HTTP client
-	client := &http.Client{
-		Timeout: 120 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: tlsConfig,
-			Proxy:           http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-				DualStack: true,
-			}).DialContext,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-		},
-		Jar: nil,
-	}
-
-	// Disable redirects if specified
-	if !website.FollowRedirects {
-		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			return http.ErrUseLastResponse
-		}
-	}
-
-	// Set User-Agent
-	userAgent := DefaultUserAgent
-	if website.UserAgent != "" {
-		userAgent = website.UserAgent
-	}
-
-	// Create request
-	req, err := http.NewRequest(http.MethodGet, url, nil)
-	if err != nil {
-		fmt.Printf("Error creating request in function MakeRequestWithErrorMsg: %v\n", err)
-		return
-	}
-
-	// Set request headers
-	req.Header.Set("User-Agent", userAgent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.5")
-	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Upgrade-Insecure-Requests", "1")
-	req.Header.Set("Sec-Fetch-Dest", "document")
-	req.Header.Set("Sec-Fetch-Mode", "navigate")
-	req.Header.Set("Sec-Fetch-Site", "none")
-	req.Header.Set("Sec-Fetch-User", "?1")
-	req.Header.Set("Cache-Control", "max-age=0")
-
-	// Add cookies if specified
-	if website.Cookies != nil {
-		for _, cookie := range website.Cookies {
-			cookieObj := &http.Cookie{
-				Name:  cookie.Name,
-				Value: cookie.Value,
-			}
-			req.AddCookie(cookieObj)
-		}
-	}
-
-	// Send request
-	res, err := client.Do(req)
-	if err != nil {
-		return
-	}
-	defer res.Body.Close()
-
-	// Check for error status codes
-	if res.StatusCode >= 400 {
-		return
-	}
-
-	// Read response body
-	body, err := io.ReadAll(res.Body)
-	if err != nil {
-		fmt.Printf("Error reading response body: %v\n", err)
-		return
-	}
-
-	// Check for profile indicator
-	bodyStr := string(body)
-	if strings.Contains(bodyStr, website.ErrorMsg) {
-		Greenf("[+] %s: %s", website.Name, url).Println()
-		WriteToFile(username, url+"\n")
-		count.Add(1)
-	}
-}
-
-// Search performs concurrent searches across all configured websites.
-func Search(data Data, username string, noFalsePositives bool, wg *sync.WaitGroup) {
-	// Iterate over websites
-	for _, website := range data.Websites {
-		// Run search in a goroutine
-		go func(website Website) {
-			var url string
-			defer wg.Done()
-
-			// Use probe URL if specified, otherwise use base URL
-			if website.URLProbe != "" {
-				url = BuildURL(website.URLProbe, username)
-			} else {
-				url = BuildURL(website.BaseURL, username)
-			}
-
-			// Handle different error types
-			switch website.ErrorType {
-			case "status_code":
-				MakeRequestWithErrorCode(website, url, username)
-			case "errorMsg":
-				MakeRequestWithErrorMsg(website, url, username)
-			case "profilePresence":
-				MakeRequestWithProfilePresence(website, url, username)
-			case "response_url":
-				MakeRequestWithResponseURL(website, url, username)
-			default:
-				// Handle unverified profiles if false positives are allowed
-				if !noFalsePositives {
-					Yellowf("[?] %s: %s", website.Name, url).Println()
-					WriteToFile(username, "[?] "+url+"\n")
-					count.Add(1)
-				}
-			}
-		}(website)
-	}
 }
 
 // DeleteOldFile removes any existing output file for the username.
 func DeleteOldFile(username string) {
 	filename := fmt.Sprintf("%s.txt", username)
-	os.Remove(filename)
+	err := os.Remove(filename)
+	if err != nil && !os.IsNotExist(err) {
+		logger.Errorf("Error deleting file %s: %v", filename, err)
+	}
+	logger.Debugf("Deleted old file %s if it existed", filename)
 }
 
-// Text creates a colored string using the specified color code.
-func Text(s string, colorCode string) Color {
-	return Color(colorCode + s + CurrentTheme.Reset)
+// runSearches executes all runners concurrently, streaming results through a channel
+func runSearches(username string, runners []Runner) chan Response {
+	resultsChan := make(chan Response, len(runners))
+	var wg sync.WaitGroup
+	for _, runner := range runners {
+		wg.Add(1)
+		go func(runner Runner) {
+			defer wg.Done()
+			result := runner.Run(username)
+			resultsChan <- result
+		}(runner)
+	}
+	go func() {
+		wg.Wait()
+		close(resultsChan)
+	}()
+	return resultsChan
 }
 
-// Red formats text in red.
-func Red(args ...interface{}) Color {
-	return Text(fmt.Sprint(args...), CurrentTheme.Red)
+// runInteractiveMode provides an interactive prompt for searching
+func runInteractiveMode(runners []Runner) {
+	for {
+		prompt := promptui.Prompt{
+			Label: "Enter username (or 'quit' to exit)",
+			Validate: func(input string) error {
+				input = strings.TrimSpace(input)
+				if input == "" {
+					return fmt.Errorf("username cannot be empty")
+				}
+				return nil
+			},
+		}
+		username, err := prompt.Run()
+		if err != nil || username == "quit" {
+			fmt.Println("Exiting interactive mode")
+			return
+		}
+		username = strings.TrimSpace(username)
+		logger.Debugf("Interactive mode: selected username %s", username)
+
+		services := AvailableServices()
+		selectPrompt := promptui.Select{
+			Label: "Select services (use arrow keys, press Enter to finish)",
+			Items: append(services, "All"),
+			Size:  10,
+		}
+		selectedServices := []string{}
+		for {
+			idx, result, err := selectPrompt.Run()
+			if err != nil {
+				break
+			}
+			if result == "All" {
+				selectedServices = services
+				break
+			}
+			selectedServices = append(selectedServices, services[idx])
+			services = append(services[:idx], services[idx+1:]...)
+			selectPrompt.Items = append(services, "All")
+		}
+		if len(selectedServices) == 0 {
+			fmt.Println("No services selected, try again")
+			continue
+		}
+		logger.Debugf("Interactive mode: selected services %v", selectedServices)
+
+		selectedRunners := make([]Runner, 0, len(selectedServices))
+		for _, s := range selectedServices {
+			if runner, ok := RunnerRegistry[s]; ok {
+				selectedRunners = append(selectedRunners, runner)
+			}
+		}
+		if len(selectedRunners) == 0 {
+			fmt.Println("No valid services selected")
+			continue
+		}
+
+		fmt.Println("\nSearching for", username, "on", strings.Join(selectedServices, ", "), "...")
+		start := time.Now()
+		resultsChan := runSearches(username, selectedRunners)
+
+		for res := range resultsChan {
+			fmt.Println()
+			if res.Error != "" {
+				Redf("[%s] Error: %s", res.Service, res.Error).Println()
+				continue
+			}
+			if res.Found {
+				Greenf("[%s] Found results", res.Service).Println()
+				if res.Data != nil {
+					table := tablewriter.NewTable(os.Stdout, tablewriter.WithHeaderConfig(tw.CellConfig{
+						Formatting: tw.CellFormatting{AutoFormat: tw.Off},
+					}))
+					res.Data.RenderTable(table)
+					if err := table.Render(); err != nil {
+						logger.Errorf("Table render failed: %v", err)
+					}
+				}
+			} else {
+				Greenf("[%s] No results found", res.Service).Println()
+			}
+		}
+
+		elapsed := time.Since(start)
+		fmt.Println()
+		table := tablewriter.NewTable(os.Stdout, tablewriter.WithRenderer(renderer.NewBlueprint(tw.Rendition{Borders: tw.BorderNone})))
+		table.Append(Bold("Number of profiles found"), Red(count.Load()))
+		table.Append(Bold("Total time taken"), Green(elapsed))
+		if err := table.Render(); err != nil {
+			logger.Errorf("Table render failed: %v", err)
+		}
+	}
 }
 
-// Green formats text in green.
-func Green(args ...interface{}) Color {
-	return Text(fmt.Sprint(args...), CurrentTheme.Green)
-}
-
-// Yellow formats text in yellow.
-func Yellow(args ...interface{}) Color {
-	return Text(fmt.Sprint(args...), CurrentTheme.Yellow)
-}
-
-// Blue formats text in blue.
-func Blue(args ...interface{}) Color {
-	return Text(fmt.Sprint(args...), CurrentTheme.Blue)
-}
-
-// Cyan formats text in cyan.
-func Cyan(args ...interface{}) Color {
-	return Text(fmt.Sprint(args...), CurrentTheme.Cyan)
-}
-
-// Magenta formats text in magenta.
-func Magenta(args ...interface{}) Color {
-	return Text(fmt.Sprint(args...), CurrentTheme.Magenta)
-}
-
-// White formats text in white.
-func White(args ...interface{}) Color {
-	return Text(fmt.Sprint(args...), CurrentTheme.White)
-}
-
-// Gray formats text in gray.
-func Gray(args ...interface{}) Color {
-	return Text(fmt.Sprint(args...), CurrentTheme.Gray)
-}
-
-// Redf formats text in red with a format string.
-func Redf(format string, args ...interface{}) Color {
-	return Text(fmt.Sprintf(format, args...), CurrentTheme.Red)
-}
-
-// Greenf formats text in green with a format string.
-func Greenf(format string, args ...interface{}) Color {
-	return Text(fmt.Sprintf(format, args...), CurrentTheme.Green)
-}
-
-// Yellowf formats text in yellow with a format string.
-func Yellowf(format string, args ...interface{}) Color {
-	return Text(fmt.Sprintf(format, args...), CurrentTheme.Yellow)
-}
-
-// Bluef formats text in blue with a format string.
-func Bluef(format string, args ...interface{}) Color {
-	return Text(fmt.Sprintf(format, args...), CurrentTheme.Blue)
-}
-
-// Cyanf formats text in cyan with a format string.
-func Cyanf(format string, args ...interface{}) Color {
-	return Text(fmt.Sprintf(format, args...), CurrentTheme.Cyan)
-}
-
-// Magentaf formats text in magenta with a format string.
-func Magentaf(format string, args ...interface{}) Color {
-	return Text(fmt.Sprintf(format, args...), CurrentTheme.Magenta)
-}
-
-// Whitef formats text in white with a format string.
-func Whitef(format string, args ...interface{}) Color {
-	return Text(fmt.Sprintf(format, args...), CurrentTheme.White)
-}
-
-// Grayf formats text in gray with a format string.
-func Grayf(format string, args ...interface{}) Color {
-	return Text(fmt.Sprintf(format, args...), CurrentTheme.Gray)
-}
-
-// Bold formats text in bold.
-func Bold(format string, args ...interface{}) Color {
-	return Text(fmt.Sprintf(format, args...), CurrentTheme.Bold)
+// contains checks if a slice contains a string
+func contains(slice []string, item string) bool {
+	for _, s := range slice {
+		if s == item {
+			return true
+		}
+	}
+	return false
 }
 
 // formatStealerDate formats a date string from HudsonRock API into a human-readable format.
 func formatStealerDate(dateStr string) string {
-	// Parse the HudsonRock API date format (e.g., "2025-05-15T05:43:36.000Z")
 	t, err := time.Parse(time.RFC3339, dateStr)
 	if err != nil {
-		return dateStr // Return original if parsing fails
+		logger.Errorf("Error parsing date %s: %v", dateStr, err)
+		return dateStr
 	}
-
-	// Format as relative time if recent, absolute date if older
 	now := time.Now()
 	diff := now.Sub(t)
-
 	switch {
 	case diff < time.Hour:
 		return "just now"
@@ -1369,7 +650,7 @@ func formatStealerDate(dateStr string) string {
 		days := int(diff.Hours() / 24)
 		return fmt.Sprintf("%d day%s ago", days, plural(days))
 	default:
-		return t.Format("Jan 2, 2006") // e.g., "May 15, 2025"
+		return t.Format("Jan 2, 2006")
 	}
 }
 
@@ -1379,15 +660,4 @@ func plural(n int) string {
 		return ""
 	}
 	return "s"
-}
-
-// detectTheme determines the terminal color theme based on the COLORFGBG environment variable.
-func detectTheme() Theme {
-	colorfgbg := os.Getenv("COLORFGBG")
-	if strings.Contains(colorfgbg, ";0") {
-		return DarkTheme // Dark background
-	} else if strings.Contains(colorfgbg, ";15") {
-		return LightTheme // Light background
-	}
-	return DarkTheme // Default
 }
