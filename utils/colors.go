@@ -1,8 +1,7 @@
-package main
+package utils
 
 import (
 	"fmt"
-	"github.com/olekukonko/tablewriter"
 	"io"
 	"os"
 	"strings"
@@ -53,102 +52,12 @@ var DarkTheme = Theme{
 	Gray:      "\033[37m", // Light gray
 }
 
+var CurrentTheme = Theme{}
+
 // init sets the initial theme based on terminal background detection.
 func init() {
 	// Override theme based on auto-detection
 	CurrentTheme = detectTheme()
-}
-
-// Website represents a website configuration for searching usernames.
-type Website struct {
-	Name            string   `json:"name"`                   // Website name
-	BaseURL         string   `json:"base_url"`               // Base URL template
-	URLProbe        string   `json:"url_probe,omitempty"`    // Optional probe URL
-	FollowRedirects bool     `json:"follow_redirects"`       // Whether to follow HTTP redirects
-	UserAgent       string   `json:"user_agent,omitempty"`   // Custom User-Agent, if any
-	ErrorType       string   `json:"errorType"`              // Type of error checking
-	ErrorMsg        string   `json:"errorMsg,omitempty"`     // Expected error message for non-existent profiles
-	ErrorCode       int      `json:"errorCode,omitempty"`    // Expected HTTP status code for non-existent profiles
-	ResponseURL     string   `json:"response_url,omitempty"` // Expected response URL for existing profiles
-	Cookies         []Cookie `json:"cookies,omitempty"`      // Cookies to include in requests
-}
-
-// Data holds the list of websites to search.
-type Data struct {
-	Websites []Website `json:"websites"` // List of website configurations
-}
-
-// Cookie represents an HTTP cookie.
-type Cookie struct {
-	Name  string `json:"name"`  // Cookie name
-	Value string `json:"value"` // Cookie value
-}
-
-// Stealer represents data from an info-stealer compromise.
-type Stealer struct {
-	TotalCorporateServices int         `json:"total_corporate_services"` // Number of corporate services compromised
-	TotalUserServices      int         `json:"total_user_services"`      // Number of user services compromised
-	DateCompromised        string      `json:"date_compromised"`         // Date of compromise
-	StealerFamily          string      `json:"stealer_family"`           // Type of stealer malware
-	ComputerName           string      `json:"computer_name"`            // Name of compromised computer
-	OperatingSystem        string      `json:"operating_system"`         // Operating system of compromised computer
-	MalwarePath            string      `json:"malware_path"`             // Path of malware on compromised system
-	Antiviruses            interface{} `json:"antiviruses"`              // Antivirus software detected
-	IP                     string      `json:"ip"`                       // IP address of compromised system
-	TopPasswords           []string    `json:"top_passwords"`            // Commonly used passwords
-	TopLogins              []string    `json:"top_logins"`               // Commonly used logins
-}
-
-// HudsonRockResponse represents the response from HudsonRock's API.
-type HudsonRockResponse struct {
-	Message  string    `json:"message"`  // Response message
-	Stealers []Stealer `json:"stealers"` // List of stealer data
-}
-
-// WeakpassResponse represents the response from Weakpass API for hash cracking.
-type WeakpassResponse struct {
-	Type string `json:"type"` // Hash type
-	Hash string `json:"hash"` // Hash value
-	Pass string `json:"pass"` // Cracked password
-}
-
-// ProxyNova represents the response from ProxyNova API for compromised passwords.
-type ProxyNova struct {
-	Count int      `json:"count"` // Number of compromised credentials
-	Lines []string `json:"lines"` // List of credential pairs
-}
-
-// ResultData defines the interface for service-specific results
-type ResultData interface {
-	RenderTable(out *tablewriter.Table)
-	String() string
-}
-
-// Response represents the standardized output from a Runner
-type Response struct {
-	Service string     `json:"service"`
-	Found   bool       `json:"found"`
-	Data    ResultData `json:"data,omitempty"`
-	Error   string     `json:"error,omitempty"`
-}
-
-// Runner defines the interface for search services
-type Runner interface {
-	Run(username string) Response
-}
-
-// RunnerRegistry maps service names to their Runner implementations
-var RunnerRegistry = map[string]Runner{
-	"hudsonrock":      HudsonRockRunner{},
-	"proxynova":       ProxyNovaRunner{},
-	"breachdirectory": BreachDirectoryRunner{},
-	"domains":         DomainsRunner{},
-	"websites":        WebsitesRunner{},
-}
-
-// HudsonRockResult represents HudsonRock search results
-type HudsonRockResult struct {
-	Stealers []Stealer
 }
 
 // Color represents a colored string for terminal output.
@@ -264,8 +173,12 @@ func Grayf(format string, args ...interface{}) Color {
 	return Text(fmt.Sprintf(format, args...), CurrentTheme.Gray)
 }
 
-// Bold formats text in bold.
-func Bold(format string, args ...interface{}) Color {
+func Bold(args ...interface{}) Color {
+	return Text(fmt.Sprint(args...), CurrentTheme.Bold)
+}
+
+// Boldf formats text in bold.
+func Boldf(format string, args ...interface{}) Color {
 	return Text(fmt.Sprintf(format, args...), CurrentTheme.Bold)
 }
 
